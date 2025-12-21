@@ -169,12 +169,12 @@ class ChatFrame(wx.Frame):
     # Tab helpers
     # -----------------------------------------------------------------
 
-    def _ensure_tab(self, name: str, select: bool) -> None:
+    def _ensure_tab(self, name: str, select: bool) -> bool:
         for idx in range(self.notebook.GetPageCount()):
             if self.notebook.GetPageText(idx) == name:
                 if select:
                     self.notebook.SetSelection(idx)
-                return
+                return False
 
         panel = wx.Panel(self.notebook)
         sizer = wx.BoxSizer(wx.VERTICAL)
@@ -184,6 +184,7 @@ class ChatFrame(wx.Frame):
 
         panel.SetSizer(sizer)
         self.notebook.AddPage(panel, name, select=select)
+        return True
 
     def _create_tab(self, name: str) -> None:
         self._ensure_tab(name, select=True)
@@ -221,11 +222,13 @@ class ChatFrame(wx.Frame):
 
     def on_node_activated(self, event: wx.ListEvent) -> None:
         name = self.node_list.GetItemText(event.GetIndex())
-        self._create_tab(name)
+        created = self._ensure_tab(name, select=True)
         self.SetStatusText(f"Active: {name}", 2)
 
-        # Load local history once per tab
-        if name != self._status_tab_name and name not in self._history_loaded:
+        # Load local history when a tab is created (e.g. first open or reopen after close)
+        if created and name != self._status_tab_name:
+            # Forget any cached flag so HistoryEvent is treated as a first load for this tab.
+            self._history_loaded.discard(name)
             try:
                 self.backend.request_history(name, limit=200)
             except AttributeError:

@@ -79,27 +79,37 @@ class ChatStore:
             limit: int = 100,
     ) -> List[Tuple[bytes, int, str, str, str, float]]:
         """
-        Return the most recent messages in a channel, ordered oldest → newest.
+        Return recent messages for a channel.
 
-        Note:
-            This returns the *last* `limit` messages (newest messages), not the first `limit`
-            rows in the database. Internally we select newest-first with a LIMIT, then
-            reorder ascending for display.
+        Notes on ordering:
+        - Messages may arrive out-of-order (testing, jitter, retries).
+        - We slice by insert order (SQLite row id) to get the *most recent* N rows,
+          then sort within that slice by (origin_id, seqno) so per-sender ordering
+          is stable and deterministic.
         """
-        sql = """
-        SELECT origin_id, seqno, channel, nick, text, ts
-        FROM (
-            SELECT origin_id, seqno, channel, nick, text, ts, id
+        if limit <= 0:
+            sql_all = """
+            SELECT origin_id, seqno, channel, nick, text, ts
             FROM chat_messages
             WHERE channel = ?
-            ORDER BY ts DESC, id DESC
-            LIMIT ?
-        )
-        ORDER BY ts ASC, id ASC;
+            ORDER BY origin_id ASC, seqno ASC, ts ASC;
+            """
+            cur = self._conn.execute(sql_all, (channel,))
+            return cur.fetchall()
+
+        sql = """
+        SELECT id, origin_id, seqno, channel, nick, text, ts
+        FROM chat_messages
+        WHERE channel = ?
+        ORDER BY id DESC
+        LIMIT ?;
         """
         cur = self._conn.execute(sql, (channel, limit))
         rows = cur.fetchall()
-        return rows
+
+        # rows: (id, origin_id, seqno, channel, nick, text, ts)
+        rows.sort(key=lambda r: (r[1], r[2], r[0]))
+        return [(r[1], r[2], r[3], r[4], r[5], r[6]) for r in rows]
 
     def get_messages_since(
             self,
