@@ -246,6 +246,24 @@ def load_chat_config_from_yaml(path: str) -> MeshChatConfig:
         raise ValueError("chat.sync.min_sync_interval_seconds must be >= 0")
     # -------------------------------
 
+    gap_related_any = sync_raw.get("gap_related", {})
+    if not isinstance(gap_related_any, dict):
+        gap_related_raw: Dict[str, Any] = {}
+    else:
+        gap_related_raw = gap_related_any
+
+    gap_related_sync_enabled = bool(gap_related_raw.get("enabled", True))
+    gap_related_min_interval_seconds = float(gap_related_raw.get("min_interval_seconds", 120.0))
+    gap_related_jitter_seconds = float(gap_related_raw.get("jitter_seconds", 2.0))
+    gap_related_last_n_messages = int(gap_related_raw.get("last_n_messages", 0))
+
+    if gap_related_min_interval_seconds < 0.0:
+        raise ValueError("chat.sync.gap_related.min_interval_seconds must be >= 0")
+    if gap_related_jitter_seconds < 0.0:
+        raise ValueError("chat.sync.gap_related.jitter_seconds must be >= 0")
+    if gap_related_last_n_messages < 0:
+        raise ValueError("chat.sync.gap_related.last_n_messages must be >= 0")
+
     peers_raw_any = chat_cfg_raw.get("peers", {})
     if not isinstance(peers_raw_any, dict):
         peers_raw = {}
@@ -281,4 +299,8 @@ def load_chat_config_from_yaml(path: str) -> MeshChatConfig:
         sync_max_send_per_response=sync_max_send_per_response,
         sync_auto_sync_on_new_peer=sync_auto_sync_on_new_peer,
         sync_min_sync_interval_seconds=sync_min_sync_interval_seconds,
+        gap_related_sync_enabled=gap_related_sync_enabled,
+        gap_related_min_interval_seconds=gap_related_min_interval_seconds,
+        gap_related_jitter_seconds=gap_related_jitter_seconds,
+        gap_related_last_n_messages=gap_related_last_n_messages,
     )

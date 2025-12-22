@@ -45,6 +45,12 @@ class MeshChatConfig:
     sync_auto_sync_on_new_peer: bool = True
     sync_min_sync_interval_seconds: float = 30.0
 
+    # Gap-Related Sync policy (Phase 1): when confirmed gaps should trigger a polite sync request.
+    gap_related_sync_enabled: bool = True
+    gap_related_min_interval_seconds: float = 120.0
+    gap_related_jitter_seconds: float = 2.0
+    gap_related_last_n_messages: int = 0  # 0 => use sync_last_n_messages
+
 
 # --------------------------------------------------------------
 # Gap detection (local, in-memory)
@@ -269,6 +275,7 @@ class MeshChatClient:
             on_chat_message: Callable[[ChatMessage, bytes, float], None],
             on_sync_applied: Optional[Callable[[str, int], None]] = None,
             on_gap_report: Optional[Callable[[str], None]] = None,
+            on_gap_confirmed: Optional[Callable[[str, bytes, str], None]] = None,
     ) -> None:
         """
         on_chat_message(ChatMessage, origin_id, created_ts)
@@ -277,6 +284,7 @@ class MeshChatClient:
         self._on_chat_message = on_chat_message
         self._on_sync_applied = on_sync_applied
         self._on_gap_report = on_gap_report
+        self._on_gap_confirmed = on_gap_confirmed
         self._gap_tracker = _GapTracker()
         self._nick = config.mesh_node_config.callsign  # default nick
 
@@ -668,6 +676,8 @@ class MeshChatClient:
                 for line in self._gap_tracker.on_seqno(origin_id=origin_bytes, seqno=seqno_int, now=float(recv_ts)):
                     if self._on_gap_report is not None:
                         self._on_gap_report(line)
+                    if self._on_gap_confirmed is not None and "(confirmed)" in line:
+                        self._on_gap_confirmed(msg.channel, origin_bytes, line)
 
             chat_msg = ChatMessage(
 

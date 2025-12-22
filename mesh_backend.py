@@ -145,6 +145,8 @@ class MeshChatBackend(BackendInterface):
         self._discovered_node_ids: Dict[str, bytes] = {}
         # Per-peer/per-channel sync cooldown tracking
         self._last_sync_time: Dict[Tuple[str, str], float] = {}
+        # Per-origin/per-channel gap-triggered sync cooldown tracking
+        self._last_gap_sync_time: Dict[Tuple[bytes, str], float] = {}
         # Sync retry/backoff scheduler state
         self._sync_retry: Dict[Tuple[str, str], _SyncRetryState] = {}
         self._sync_retry_lock = threading.Lock()
@@ -161,6 +163,7 @@ class MeshChatBackend(BackendInterface):
             on_chat_message=self._on_chat_message,
             on_sync_applied=self._on_sync_applied,
             on_gap_report=self._on_gap_report,
+            on_gap_confirmed=self._on_gap_confirmed,
         )
 
         # Run MeshChatClient.start() in its own thread
@@ -318,6 +321,58 @@ class MeshChatBackend(BackendInterface):
     def _on_gap_report(self, text: str) -> None:
         """Callback from MeshChatClient when a gap report is generated."""
         self._emit_status(text)
+
+    def _on_gap_confirmed(self, channel: str, origin_id: bytes, _report_line: str) -> None:
+        """Policy layer: decide when a confirmed gap should trigger a polite sync attempt.
+
+        Uses existing request_sync_last_n() primitive; no protocol changes.
+        """
+        cfg = self._config
+        if not getattr(cfg, "sync_enabled", True):
+            return
+        if not getattr(cfg, "gap_related_sync_enabled", True):
+            return
+
+        # Rate-limit: gap-related sync is intentionally slower than normal sync.
+        base_min = float(getattr(cfg, "sync_min_sync_interval_seconds", 30.0))
+        gap_min = float(getattr(cfg, "gap_related_min_interval_seconds", 120.0))
+        min_interval = gap_min if gap_min > base_min else base_min
+
+        now = time.time()
+        key = (origin_id, channel)
+        last_ts = self._last_gap_sync_time.get(key)
+        if last_ts is not None and (now - last_ts) < min_interval:
+            return
+
+        # Deterministic tiny jitter (no random import).
+        jitter_window = float(getattr(cfg, "gap_related_jitter_seconds", 2.0))
+        if jitter_window > 0.0:
+            jitter = (sum(origin_id) + len(channel)) % 1000
+            now = now + (jitter_window * (jitter / 1000.0))
+
+        # Choose last_n: allow override, else use configured sync_last_n_messages.
+        override_last_n = int(getattr(cfg, "gap_related_last_n_messages", 0))
+        last_n = override_last_n if override_last_n > 0 else int(getattr(cfg, "sync_last_n_messages", 200))
+
+        # Prefer syncing directly from the origin that exhibited the confirmed gap.
+        callsign = None
+        for cs, nid in self._discovered_node_ids.items():
+            if nid == origin_id:
+                callsign = cs
+                break
+
+        try:
+            if callsign is not None:
+                self._client.request_sync_last_n(dest_node_id=origin_id, channel=channel, last_n=last_n)
+                self._last_gap_sync_time[key] = now
+                self._emit_status(f"Gap-related sync requested for {channel} from {callsign}")
+            else:
+                # Fallback: use existing channel sync behavior (default peer / DM semantics).
+                self.request_sync_for_channel(channel)
+                self._last_gap_sync_time[key] = now
+                self._emit_status(f"Gap-related sync requested for {channel} (fallback)")
+        except (OSError, ValueError, ArdopLinkError) as exc:
+            self._emit_status(f"Gap-related sync request failed for {channel}: {exc}")
 
     def _status_loop(self) -> None:
         while self._running:
