@@ -58,7 +58,7 @@ class ChatFrame(wx.Frame):
 
         # Preload local history for #general (does not steal focus)
         try:
-            self.backend.request_history("#general", limit=200)
+            self.backend.request_history("#general", limit=0)
         except AttributeError:
             pass
 
@@ -235,7 +235,7 @@ class ChatFrame(wx.Frame):
             # Forget any cached flag so HistoryEvent is treated as a first load for this tab.
             self._history_loaded.discard(name)
             try:
-                self.backend.request_history(name, limit=200)
+                self.backend.request_history(name, limit=0)
             except AttributeError:
                 pass
 
@@ -325,7 +325,7 @@ class ChatFrame(wx.Frame):
 
         for name in open_tabs:
             try:
-                self.backend.request_history(name, limit=200)
+                self.backend.request_history(name, limit=0)
             except AttributeError:
                 break
 
@@ -391,16 +391,28 @@ class ChatFrame(wx.Frame):
     def _render_history_event(self, ev: HistoryEvent) -> None:
         self._ensure_tab(ev.channel, select=False)
 
-        first_load = ev.channel not in self._history_loaded
-        if first_load:
-            self._history_loaded.add(ev.channel)
-            ctrl = self._get_text_ctrl_for_tab(ev.channel)
-            if ctrl is not None:
-                ctrl.SetValue("")
+        # HistoryEvent is treated as a full snapshot for the tab.
+        self._history_loaded.add(ev.channel)
 
-        for (origin_id, seqno, channel, nick, text, ts) in ev.messages:
+        ctrl = self._get_text_ctrl_for_tab(ev.channel)
+        if ctrl is None:
+            return
+
+        lines: list[str] = []
+        for (_origin_id, _seqno, channel, nick, text, ts) in ev.messages:
             ts_str = time.strftime("%H:%M:%S", time.localtime(ts))
-            self._append_to_tab(channel, f"[{ts_str}] <{nick}> {text}\n")
+            lines.append(f"[{ts_str}] <{nick}> {text}\n")
+
+        # Bulk update: avoid per-line UI repaints (much faster for large history).
+        try:
+            ctrl.Freeze()
+        except AttributeError:
+            pass
+        ctrl.SetValue("".join(lines))
+        try:
+            ctrl.Thaw()
+        except AttributeError:
+            pass
 
     def _rebuild_left_list(self) -> None:
         selected = None
