@@ -291,17 +291,18 @@ class ChatFrame(wx.Frame):
         left_panel = wx.Panel(splitter)
         left_sizer = wx.BoxSizer(wx.VERTICAL)
 
-        label = wx.StaticText(left_panel, label="Nodes / Channels")
-        self.node_list = wx.ListCtrl(left_panel, style=wx.LC_REPORT | wx.LC_SINGLE_SEL)
-        self.node_list.InsertColumn(0, "Name", width=200)
+        self.node_list = wx.ListCtrl(
+            left_panel,
+            style=wx.LC_REPORT | wx.LC_SINGLE_SEL | wx.LC_NO_HEADER,
+        )
+        # Single hidden header column; LC_NO_HEADER removes the visible header bar.
+        self.node_list.InsertColumn(0, "", width=200)
 
         # Built-in channel(s). Dynamic channels/nodes are populated from mesh state + DB.
         self.node_list.InsertItem(0, "#general")
 
         self.node_list.Bind(wx.EVT_LIST_ITEM_ACTIVATED, self.on_node_activated)
-
-        left_sizer.Add(label, 0, wx.EXPAND | wx.ALL, 4)
-        left_sizer.Add(self.node_list, 1, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 4)
+        left_sizer.Add(self.node_list, 1, wx.EXPAND)
         left_panel.SetSizer(left_sizer)
 
         # Right panel: notebook
@@ -667,35 +668,29 @@ class ChatFrame(wx.Frame):
     # -----------------------------------------------------------------
 
     def on_close(self, _event: wx.CloseEvent) -> None:
-        # Make window close immediately; perform backend shutdown asynchronously.
-        if getattr(self, "_closing", False):
-            return
-
+        # Close the window immediately to avoid blocking the GUI thread on backend shutdown.
         try:
             self._timer.Stop()
-        except AttributeError:
+        except (AttributeError, TypeError, ValueError):
             pass
 
-        # Hide immediately to avoid "hung" close feeling.
         try:
             self.Hide()
-        except AttributeError:
+        except (AttributeError, TypeError, ValueError):
             pass
 
-        def _shutdown_backend() -> None:
-            # Keep this narrow: shutdown should be robust, but don't crash on expected IO issues.
+        def _shutdown_then_destroy() -> None:
             try:
                 self.backend.shutdown()
-            except (OSError, ValueError):
+            except (AttributeError, OSError, ValueError):
+                pass
+            try:
+                wx.CallAfter(self.Destroy)
+            except (AttributeError, TypeError, ValueError):
                 pass
 
-        threading.Thread(
-            target=_shutdown_backend,
-            name="GUI-BackendShutdown",
-            daemon=True,
-        ).start()
-
-        self.Destroy()
+        t = threading.Thread(target=_shutdown_then_destroy, name="MeshChatShutdown", daemon=True)
+        t.start()
 
 
 class MeshChatApp(wx.App):
