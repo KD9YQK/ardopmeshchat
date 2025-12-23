@@ -137,6 +137,10 @@ class MeshChatBackend(BackendInterface):
         :param status_heartbeat_interval: if > 0, emits periodic StatusEvent heartbeats
         """
         self._config = config
+        try:
+            self._node_mode = str(getattr(config, "node_mode", "full") or "full").strip().lower()
+        except Exception:
+            self._node_mode = "full"
         self._default_peer_nick = default_peer_nick
         self._ui_queue: queue.Queue[UIEvent] = queue.Queue()
         self._running = True
@@ -203,6 +207,16 @@ class MeshChatBackend(BackendInterface):
     def get_ui_queue(self) -> queue.Queue[UIEvent]:
         return self._ui_queue
 
+    # ----------------------------------------------------------
+    # Role-based mode gates (Feature #3)
+    # ----------------------------------------------------------
+
+    def _can_originate_chat(self) -> bool:
+        return self._node_mode == "full"
+
+    def _can_initiate_sync(self) -> bool:
+        return self._node_mode == "full"
+
     def send_message(self, channel: str, text: str) -> None:
         """
         Called by the GUI when user hits Send.
@@ -215,6 +229,10 @@ class MeshChatBackend(BackendInterface):
         """
         text = text.strip()
         if not text:
+            return
+
+        if not self._can_originate_chat():
+            self._emit_status(f"Send blocked: node_mode={self._node_mode!r} (chat origination disabled)")
             return
 
         # DM: treat exactly like a channel, but route to a specific destination.
@@ -627,6 +645,10 @@ class MeshChatBackend(BackendInterface):
         """
         self._emit_status(text)
 
+        # In non-full roles we observe gaps but do not initiate targeted sync.
+        if not self._can_initiate_sync():
+            return
+
         # Example line:
         #   KD9YQK-1 missing seq 142–147, 150 (confirmed)
         if " (confirmed)" not in text:
@@ -784,7 +806,7 @@ class MeshChatBackend(BackendInterface):
             new_peers = sorted(set(nodes) - prev_nodes)
             if new_peers:
                 cfg = self._config
-                if getattr(cfg, "sync_enabled", True) and getattr(cfg, "sync_auto_sync_on_new_peer", True):
+                if self._can_initiate_sync() and getattr(cfg, "sync_enabled", True) and getattr(cfg, "sync_auto_sync_on_new_peer", True):
                     channel = "#general"
                     last_n = int(getattr(cfg, "sync_last_n_messages", 200))
                     min_interval = float(getattr(cfg, "sync_min_sync_interval_seconds", 30.0))
@@ -826,6 +848,8 @@ class MeshChatBackend(BackendInterface):
         - For normal channels ("#general"): sync is requested from the default peer.
         """
         cfg = self._config
+        if not self._can_initiate_sync():
+            return
         if not getattr(cfg, "sync_enabled", True):
             return
 
@@ -941,6 +965,8 @@ class MeshChatBackend(BackendInterface):
         This does not introduce new sync behavior; it only retries after a request
         has been made (manual or auto-sync). Rate limiting and backoff are handled here.
         """
+        if not self._can_initiate_sync():
+            return
         key = (str(peer_label), str(channel))
         now = time.time()
         with self._sync_retry_lock:
@@ -993,6 +1019,12 @@ class MeshChatBackend(BackendInterface):
             time.sleep(0.5)
             if not self._running:
                 return
+
+            if not self._can_initiate_sync():
+                # Ensure we never emit sync traffic in relay/monitor modes.
+                with self._sync_retry_lock:
+                    self._sync_retry.clear()
+                continue
 
             now = time.time()
             due: List[_SyncRetryState] = []

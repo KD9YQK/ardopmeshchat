@@ -40,6 +40,10 @@ class MeshChatConfig:
     db_path: str
     peers: Dict[str, ChatPeer] = field(default_factory=dict)
 
+    # Role-based node mode (Feature #3). Default preserves existing behavior.
+    # Allowed values: "full", "relay", "monitor".
+    node_mode: str = "full"
+
     # Sync configuration (all optional; defaults are sane)
     sync_enabled: bool = True
     sync_last_n_messages: int = 200
@@ -292,6 +296,11 @@ class MeshChatClient:
         on_chat_message(ChatMessage, origin_id, created_ts)
         """
         self._config = config
+        # Normalize mode defensively; config loader validates allowed values.
+        try:
+            self._node_mode = str(getattr(config, "node_mode", "full") or "full").strip().lower()
+        except Exception:
+            self._node_mode = "full"
         self._on_chat_message = on_chat_message
         self._on_sync_applied = on_sync_applied
         self._on_gap_report = on_gap_report
@@ -422,6 +431,21 @@ class MeshChatClient:
         return []
 
     # --------------------------------------------------------------
+    # Role-based capability gates (Feature #3)
+    # --------------------------------------------------------------
+
+    def _can_originate_chat(self) -> bool:
+        return self._node_mode == "full"
+
+    def _can_store_chat(self) -> bool:
+        # Keep this conservative: relay/monitor do not persist chat by default.
+        return self._node_mode == "full"
+
+    def _can_participate_in_sync(self) -> bool:
+        # Sync participation is treated as part of full chat participation.
+        return self._node_mode == "full"
+
+    # --------------------------------------------------------------
     # Sending messages
     # --------------------------------------------------------------
 
@@ -444,6 +468,9 @@ class MeshChatClient:
     ) -> None:
         if self._mesh_node is None:
             raise ValueError(self._startup_error or "Mesh node not started")
+
+        if not self._can_originate_chat():
+            raise ValueError(f"Chat origination disabled by node_mode={self._node_mode!r}")
         msg = ChatMessage(
             msg_type=CHAT_TYPE_MESSAGE,
             channel=channel,
@@ -453,18 +480,19 @@ class MeshChatClient:
         )
         payload = encode_chat_message(msg)
         data_seqno = self._mesh_node.send_application_data(dest_node_id, payload)
-        # Log locally as "sent"
-        now = time.time()
-        created_ts = int(msg.created_ts)
-        self._store.add_message(
-            origin_id=self.get_node_id(),
-            seqno=int(data_seqno),
-            channel=channel,
-            nick=self._nick,
-            text=text,
-            ts=now,
-            created_ts=created_ts,
-        )
+        # Log locally as "sent" (if enabled for this role)
+        if self._can_store_chat():
+            now = time.time()
+            created_ts = int(msg.created_ts)
+            self._store.add_message(
+                origin_id=self.get_node_id(),
+                seqno=int(data_seqno),
+                channel=channel,
+                nick=self._nick,
+                text=text,
+                ts=now,
+                created_ts=created_ts,
+            )
 
     # --------------------------------------------------------------
     # Sync API
@@ -476,6 +504,10 @@ class MeshChatClient:
             channel: str,
             since_ts: float,
     ) -> None:
+        if not self._can_participate_in_sync():
+            raise ValueError(f"Sync participation disabled by node_mode={self._node_mode!r}")
+        if self._mesh_node is None:
+            raise ValueError(self._startup_error or "Mesh node not started")
         """
         v1: Ask a peer for messages in `channel` after `since_ts`.
         """
@@ -488,6 +520,8 @@ class MeshChatClient:
             channel: str,
             last_n: Optional[int] = None,
     ) -> None:
+        if not self._can_participate_in_sync():
+            raise ValueError(f"Sync participation disabled by node_mode={self._node_mode!r}")
         if self._mesh_node is None:
             raise ValueError(self._startup_error or "Mesh node not started")
         """
@@ -525,6 +559,8 @@ class MeshChatClient:
             start_seqno: int,
             end_seqno: int,
     ) -> None:
+        if not self._can_participate_in_sync():
+            raise ValueError(f"Sync participation disabled by node_mode={self._node_mode!r}")
         if self._mesh_node is None:
             raise ValueError(self._startup_error or "Mesh node not started")
         """
@@ -654,9 +690,11 @@ class MeshChatClient:
         if msg.msg_type == CHAT_TYPE_MESSAGE:
             self._handle_incoming_chat_message(origin_id, data_seqno, msg, now)
         elif msg.msg_type == CHAT_TYPE_SYNC_REQUEST:
-            self._handle_sync_request(origin_id, msg)
+            if self._can_participate_in_sync():
+                self._handle_sync_request(origin_id, msg)
         elif msg.msg_type == CHAT_TYPE_SYNC_RESPONSE:
-            self._handle_sync_response(msg)
+            if self._can_participate_in_sync():
+                self._handle_sync_response(msg)
 
     def _handle_incoming_chat_message(
             self,
@@ -665,15 +703,16 @@ class MeshChatClient:
             msg: ChatMessage,
             recv_ts: float,
     ) -> None:
-        self._store.add_message(
-            origin_id=origin_id,
-            seqno=data_seqno,
-            channel=msg.channel,
-            nick=msg.nick,
-            text=msg.text,
-            ts=recv_ts,
-            created_ts=int(getattr(msg, "created_ts", int(recv_ts))),
-        )
+        if self._can_store_chat():
+            self._store.add_message(
+                origin_id=origin_id,
+                seqno=data_seqno,
+                channel=msg.channel,
+                nick=msg.nick,
+                text=msg.text,
+                ts=recv_ts,
+                created_ts=int(getattr(msg, "created_ts", int(recv_ts))),
+            )
 
         # Gap detection (local-only)
         if self._gap_tracker is not None:
@@ -795,6 +834,8 @@ class MeshChatClient:
             self,
             msg: ChatMessage,
     ) -> None:
+        if not self._can_store_chat():
+            return
         records = parse_sync_response(msg)
         if records is None:
             return
