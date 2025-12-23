@@ -300,6 +300,8 @@ class MeshChatClient:
 
         self._store = ChatStore(config.db_path)
 
+        self._link_client = None  # set by link_client_factory
+
         def link_client_factory(rx_callback):
             links = []
 
@@ -355,8 +357,11 @@ class MeshChatClient:
                 raise ValueError("No enabled links configured (ARDOP disabled and TCP disabled).")
 
             if len(links) == 1:
+                self._link_client = links[0]
                 return links[0]
-            return MultiplexLinkClient(links)
+            mux = MultiplexLinkClient(links)
+            self._link_client = mux
+            return mux
 
         self._startup_error: Optional[str] = None
         try:
@@ -392,6 +397,29 @@ class MeshChatClient:
         if self._mesh_node is None:
             return b""
         return getattr(self._mesh_node, "_node_id", b"")
+
+    def get_link_metrics(self) -> list[dict]:
+        """
+        Return per-link metrics/health snapshots when the active link client supports it.
+
+        Shape:
+          - Single link: [metrics_dict]
+          - Multiplex: metrics_dict may include "links": [...]
+        """
+        lc = self._link_client
+        if lc is None:
+            return []
+        gm = getattr(lc, "get_metrics", None)
+        if callable(gm):
+            m = gm()
+            # multiplex returns an envelope with nested links
+            if isinstance(m, dict) and m.get("link_type") == "multiplex":
+                links = m.get("links")
+                if isinstance(links, list):
+                    return [m]
+                return [m]
+            return [m] if isinstance(m, dict) else []
+        return []
 
     # --------------------------------------------------------------
     # Sending messages

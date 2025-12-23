@@ -307,6 +307,89 @@ class MeshChatBackend(BackendInterface):
     def _emit_status(self, text: str) -> None:
         self._ui_queue.put(StatusEvent(text=text))
 
+    @staticmethod
+    def _format_link_metrics(m: dict) -> str:
+        """Format a best-effort per-link metrics snapshot into a single status line.
+
+        This is intentionally defensive: link metric dictionaries may evolve and should
+        never break the GUI/daemon if a key is missing.
+        """
+        try:
+            name = str(m.get("name") or m.get("link_name") or "link")
+        except (AttributeError, TypeError, ValueError):
+            name = "link"
+
+        try:
+            ltype = str(m.get("type") or m.get("link_type") or "unknown")
+        except (AttributeError, TypeError, ValueError):
+            ltype = "unknown"
+
+        running = bool(m.get("running", False))
+        connected = bool(m.get("connected", False))
+
+        frames_tx = int(m.get("frames_tx", 0) or 0)
+        frames_rx = int(m.get("frames_rx", 0) or 0)
+        bytes_tx = int(m.get("bytes_tx", 0) or 0)
+        bytes_rx = int(m.get("bytes_rx", 0) or 0)
+
+        connect_attempts = int(m.get("connect_attempts", 0) or 0)
+        connect_successes = int(m.get("connect_successes", 0) or 0)
+        disconnects = int(m.get("disconnects", 0) or 0)
+        drops = int(m.get("drops", 0) or 0)
+
+        last_rx_ts = m.get("last_rx_ts")
+        rx_age_s = None
+        if isinstance(last_rx_ts, (int, float)) and last_rx_ts > 0:
+            rx_age_s = max(0.0, time.time() - float(last_rx_ts))
+
+        last_tx_ts = m.get("last_tx_ts")
+        tx_age_s = None
+        if isinstance(last_tx_ts, (int, float)) and last_tx_ts > 0:
+            tx_age_s = max(0.0, time.time() - float(last_tx_ts))
+
+        parts = [
+            f"[LINK] {name} ({ltype})",
+            f"running={1 if running else 0}",
+            f"connected={1 if connected else 0}",
+            f"tx={frames_tx}f/{bytes_tx}B",
+            f"rx={frames_rx}f/{bytes_rx}B",
+        ]
+        if rx_age_s is not None:
+            parts.append(f"rx_age={rx_age_s:.1f}s")
+        if tx_age_s is not None:
+            parts.append(f"tx_age={tx_age_s:.1f}s")
+        if connect_attempts or connect_successes:
+            parts.append(f"conn={connect_successes}/{connect_attempts}")
+        if disconnects:
+            parts.append(f"disc={disconnects}")
+        if drops:
+            parts.append(f"drops={drops}")
+
+        # Multiplex links may include nested per-link metrics.
+        child_links = m.get("child_links")
+        if isinstance(child_links, list) and child_links:
+            # Summarize connection state without spamming the status window.
+            states = []
+            for c in child_links[:6]:  # cap
+                try:
+                    cn = str(c.get("name") or c.get("link_name") or "?")
+                    cc = "1" if bool(c.get("connected", False)) else "0"
+                    states.append(f"{cn}:{cc}")
+                except (AttributeError, TypeError, ValueError):
+                    continue
+            if states:
+                parts.append("children=" + ",".join(states))
+
+        last_error = m.get("last_error")
+        if isinstance(last_error, str) and last_error:
+            # keep it readable; the raw exception repr can be huge
+            cleaned = " ".join(last_error.split())
+            if len(cleaned) > 160:
+                cleaned = cleaned[:157] + "..."
+            parts.append(f'err="{cleaned}"')
+
+        return " ".join(parts)
+
     def _on_sync_applied(self, channel: str, applied_count: int) -> None:
         """Callback from MeshChatClient when a SYNC_RESPONSE is applied to the DB."""
         self._emit_status(f"Sync applied for {channel}: {applied_count} new message(s)")
@@ -452,6 +535,15 @@ class MeshChatBackend(BackendInterface):
             if not self._running:
                 return
             self._emit_status("MeshChat backend heartbeat.")
+
+            # Per-link health/metrics snapshot (best-effort, no protocol changes)
+            try:
+                metrics_list = self._client.get_link_metrics()
+            except (OSError, ValueError, AttributeError, TypeError):
+                metrics_list = []
+
+            for m in metrics_list:
+                self._emit_status(self._format_link_metrics(m))
 
     # ----------------------------------------------------------
     # Node/Channel state -> UI
