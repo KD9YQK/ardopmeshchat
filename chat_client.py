@@ -34,6 +34,38 @@ class ChatPeer:
     nick: str
 
 
+@dataclass(frozen=True)
+class ChannelSyncPolicy:
+    """Channel-scoped sync policy overrides (Feature #4).
+
+    This is a *policy/gating layer* only. It must not change protocol behavior.
+    Any field set to None means "use global defaults".
+
+    Matching:
+      - Exact match by default
+      - If match_prefix is True, policy applies when channel.startswith(channel)
+    """
+
+    channel: str
+    match_prefix: bool = False
+
+    # Override global sync enablement for this channel
+    enabled: Optional[bool] = None
+
+    # If True, do not send immediately; enqueue and attempt opportunistically.
+    defer: Optional[bool] = None
+
+    # Override global min sync interval for this channel
+    min_interval_seconds: Optional[float] = None
+
+    # Override global last-N inventory size for this channel
+    last_n_messages: Optional[int] = None
+
+    # If set > 0, only sync when at least one link has seen RX within this window.
+    # This is best-effort; if link metrics are unavailable, the system treats links as usable.
+    require_recent_rx_seconds: Optional[float] = None
+
+
 @dataclass
 class MeshChatConfig:
     mesh_node_config: MeshNodeConfig
@@ -51,6 +83,9 @@ class MeshChatConfig:
     sync_auto_sync_on_new_peer: bool = True
     sync_min_sync_interval_seconds: float = 30.0
 
+    # Channel-scoped sync policies (Feature #4). Optional; defaults preserve current behavior.
+    sync_channel_policies: List[ChannelSyncPolicy] = field(default_factory=list)
+
     # Gap-related sync policy (v2, policy layer)
     gap_related_sync_enabled: bool = True
     gap_related_min_interval_seconds: float = 120.0
@@ -66,6 +101,118 @@ class MeshChatConfig:
     targeted_sync_max_range_len: int = 50
     # Maximum number of range requests to emit per confirmed-gap trigger.
     targeted_sync_max_requests_per_trigger: int = 3
+
+    def get_channel_sync_policy(self, channel: str) -> ChannelSyncPolicy:
+        """Resolve channel-scoped sync policy.
+
+        Base policy is derived from global chat.sync settings (enabled, min interval, last-N).
+        Per-channel entries then override those values.
+        """
+        # Start from global defaults (preserve current behavior when no policies are configured)
+        eff = ChannelSyncPolicy(
+            channel=str(channel),
+            match_prefix=False,
+            enabled=bool(getattr(self, "sync_enabled", True)),
+            defer=False,
+            min_interval_seconds=float(getattr(self, "sync_min_sync_interval_seconds", 30.0)),
+            last_n_messages=int(getattr(self, "sync_last_n_messages", 200)),
+            require_recent_rx_seconds=0.0,
+        )
+
+        policies = getattr(self, "sync_channel_policies", None)
+        if not isinstance(policies, list):
+            return eff
+
+        chan = str(channel)
+        for p in policies:
+            if not isinstance(p, ChannelSyncPolicy):
+                continue
+            try:
+                key = str(p.channel)
+            except Exception:
+                continue
+            if not key:
+                continue
+
+            if bool(getattr(p, "match_prefix", False)):
+                match = chan.startswith(key)
+            else:
+                match = (chan == key)
+
+            if not match:
+                continue
+
+            # Apply overrides (None means "no override")
+            if p.enabled is not None:
+                eff = ChannelSyncPolicy(
+                    channel=eff.channel,
+                    match_prefix=eff.match_prefix,
+                    enabled=bool(p.enabled),
+                    defer=eff.defer,
+                    min_interval_seconds=eff.min_interval_seconds,
+                    last_n_messages=eff.last_n_messages,
+                    require_recent_rx_seconds=eff.require_recent_rx_seconds,
+                )
+            if p.defer is not None:
+                eff = ChannelSyncPolicy(
+                    channel=eff.channel,
+                    match_prefix=eff.match_prefix,
+                    enabled=eff.enabled,
+                    defer=bool(p.defer),
+                    min_interval_seconds=eff.min_interval_seconds,
+                    last_n_messages=eff.last_n_messages,
+                    require_recent_rx_seconds=eff.require_recent_rx_seconds,
+                )
+            if p.min_interval_seconds is not None:
+                try:
+                    v = float(p.min_interval_seconds)
+                except (TypeError, ValueError):
+                    v = float(eff.min_interval_seconds or 0.0)
+                if v < 0.0:
+                    v = 0.0
+                eff = ChannelSyncPolicy(
+                    channel=eff.channel,
+                    match_prefix=eff.match_prefix,
+                    enabled=eff.enabled,
+                    defer=eff.defer,
+                    min_interval_seconds=v,
+                    last_n_messages=eff.last_n_messages,
+                    require_recent_rx_seconds=eff.require_recent_rx_seconds,
+                )
+            if p.last_n_messages is not None:
+                try:
+                    n = int(p.last_n_messages)
+                except (TypeError, ValueError):
+                    n = int(eff.last_n_messages or 0)
+                if n < 0:
+                    n = 0
+                eff = ChannelSyncPolicy(
+                    channel=eff.channel,
+                    match_prefix=eff.match_prefix,
+                    enabled=eff.enabled,
+                    defer=eff.defer,
+                    min_interval_seconds=eff.min_interval_seconds,
+                    last_n_messages=n,
+                    require_recent_rx_seconds=eff.require_recent_rx_seconds,
+                )
+            if p.require_recent_rx_seconds is not None:
+                try:
+                    r = float(p.require_recent_rx_seconds)
+                except (TypeError, ValueError):
+                    r = float(eff.require_recent_rx_seconds or 0.0)
+                if r < 0.0:
+                    r = 0.0
+                eff = ChannelSyncPolicy(
+                    channel=eff.channel,
+                    match_prefix=eff.match_prefix,
+                    enabled=eff.enabled,
+                    defer=eff.defer,
+                    min_interval_seconds=eff.min_interval_seconds,
+                    last_n_messages=eff.last_n_messages,
+                    require_recent_rx_seconds=r,
+                )
+
+        return eff
 
 
 # --------------------------------------------------------------

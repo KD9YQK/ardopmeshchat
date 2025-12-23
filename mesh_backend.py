@@ -139,7 +139,7 @@ class MeshChatBackend(BackendInterface):
         self._config = config
         try:
             self._node_mode = str(getattr(config, "node_mode", "full") or "full").strip().lower()
-        except Exception:
+        except (AttributeError, TypeError, ValueError):
             self._node_mode = "full"
         self._default_peer_nick = default_peer_nick
         self._ui_queue: queue.Queue[UIEvent] = queue.Queue()
@@ -152,6 +152,9 @@ class MeshChatBackend(BackendInterface):
         self._last_sync_time: Dict[Tuple[str, str], float] = {}
         # Sync retry/backoff scheduler state
         self._sync_retry: Dict[Tuple[str, str], _SyncRetryState] = {}
+        # Pending (deferred/opportunistic) sync requests keyed by (peer_label, channel)
+        self._pending_sync: Dict[Tuple[str, str], dict] = {}
+        self._pending_sync_lock = threading.Lock()
         self._sync_retry_lock = threading.Lock()
         self._sync_retry_thread = threading.Thread(
             target=self._sync_retry_loop,
@@ -649,6 +652,14 @@ class MeshChatBackend(BackendInterface):
         if not self._can_initiate_sync():
             return
 
+        # Gap reports do not currently include channel context; targeted gap-sync is
+        # scoped to #general only (existing behavior). Keep it explicit here.
+        channel = "#general"
+
+        # Channel-scoped policy gating (Feature #4): allow disabling targeted sync per channel.
+        if not self._policy_effective_enabled(channel):
+            return
+
         # Example line:
         #   KD9YQK-1 missing seq 142–147, 150 (confirmed)
         if " (confirmed)" not in text:
@@ -681,7 +692,7 @@ class MeshChatBackend(BackendInterface):
             return
 
         # Rate limit per-origin for gap-triggered requests
-        min_interval = float(getattr(cfg, "sync_min_sync_interval_seconds", 30.0))
+        min_interval = self._policy_min_interval(channel)
         if min_interval < 0.0:
             min_interval = 0.0
 
@@ -760,7 +771,7 @@ class MeshChatBackend(BackendInterface):
             for s, e in chunks:
                 self._client.request_sync_range(
                     dest_node_id=node_id,
-                    channel="#general",
+                    channel=channel,
                     origin_id=node_id,
                     start_seqno=s,
                     end_seqno=e,
@@ -784,8 +795,8 @@ class MeshChatBackend(BackendInterface):
             except (OSError, ValueError, AttributeError, TypeError):
                 metrics_list = []
 
-            for m in metrics_list:
-                self._emit_status(self._format_link_metrics(m))
+            for mdict in metrics_list:
+                self._emit_status(self._format_link_metrics(mdict))
 
     def _nodes_loop(self) -> None:
         """Periodically snapshot routing state and notify the GUI."""
@@ -806,10 +817,11 @@ class MeshChatBackend(BackendInterface):
             new_peers = sorted(set(nodes) - prev_nodes)
             if new_peers:
                 cfg = self._config
-                if self._can_initiate_sync() and getattr(cfg, "sync_enabled", True) and getattr(cfg, "sync_auto_sync_on_new_peer", True):
+                if self._can_initiate_sync() and getattr(cfg, "sync_auto_sync_on_new_peer",
+                                                         True) and self._policy_effective_enabled("#general"):
                     channel = "#general"
-                    last_n = int(getattr(cfg, "sync_last_n_messages", 200))
-                    min_interval = float(getattr(cfg, "sync_min_sync_interval_seconds", 30.0))
+                    last_n = self._policy_last_n(channel)
+                    min_interval = self._policy_min_interval(channel)
                     now = time.time()
                     for callsign in new_peers:
                         node_id = self._discovered_node_ids.get(callsign)
@@ -819,6 +831,21 @@ class MeshChatBackend(BackendInterface):
                         last_ts = self._last_sync_time.get(key)
                         if last_ts is not None and (now - last_ts) < min_interval:
                             continue
+                        defer = self._policy_defer(channel)
+                        require_recent_rx_s = self._policy_require_recent_rx(channel)
+
+                        if require_recent_rx_s > 0.0 and not self._links_usable_for_policy(require_recent_rx_s):
+                            if defer:
+                                self._enqueue_pending_sync(peer_label=callsign, channel=channel, dest_node_id=node_id,
+                                                           last_n=last_n, reason="auto_peer_link_gate")
+                            continue
+
+                        if defer:
+                            self._enqueue_pending_sync(peer_label=callsign, channel=channel, dest_node_id=node_id,
+                                                       last_n=last_n, reason="auto_peer_deferred")
+                            self._emit_status(f"Auto-sync deferred for {channel} from {callsign} (policy)")
+                            continue
+
                         try:
                             self._client.request_sync_last_n(dest_node_id=node_id, channel=channel, last_n=last_n)
                             self._last_sync_time[key] = now
@@ -850,16 +877,18 @@ class MeshChatBackend(BackendInterface):
         cfg = self._config
         if not self._can_initiate_sync():
             return
-        if not getattr(cfg, "sync_enabled", True):
+
+        # Channel-scoped policy gating (Feature #4). Defaults preserve current behavior.
+        if not self._policy_effective_enabled(channel):
             return
 
-        last_n = int(getattr(cfg, "sync_last_n_messages", 200))
+        last_n = self._policy_last_n(channel)
         if last_n <= 0:
             return
 
-        min_interval = float(getattr(cfg, "sync_min_sync_interval_seconds", 30.0))
-        if min_interval < 0.0:
-            min_interval = 0.0
+        min_interval = self._policy_min_interval(channel)
+        defer = self._policy_defer(channel)
+        require_recent_rx_s = self._policy_require_recent_rx(channel)
 
         now = time.time()
 
@@ -874,6 +903,19 @@ class MeshChatBackend(BackendInterface):
             key = (callsign, channel)
             last_ts = self._last_sync_time.get(key)
             if last_ts is not None and (now - last_ts) < min_interval:
+                return
+
+            # Optional link gating for opportunistic sync (policy-controlled)
+            if require_recent_rx_s > 0.0 and not self._links_usable_for_policy(require_recent_rx_s):
+                if defer:
+                    self._enqueue_pending_sync(peer_label=callsign, channel=channel, dest_node_id=node_id,
+                                               last_n=last_n, reason="manual_dm_link_gate")
+                return
+
+            if defer:
+                self._enqueue_pending_sync(peer_label=callsign, channel=channel, dest_node_id=node_id, last_n=last_n,
+                                           reason="manual_dm_deferred")
+                self._emit_status(f"Sync deferred for {channel} from {callsign} (policy)")
                 return
 
             try:
@@ -896,6 +938,19 @@ class MeshChatBackend(BackendInterface):
         key = (peer_label, channel)
         last_ts = self._last_sync_time.get(key)
         if last_ts is not None and (now - last_ts) < min_interval:
+            return
+
+        # Optional link gating for opportunistic sync (policy-controlled)
+        if require_recent_rx_s > 0.0 and not self._links_usable_for_policy(require_recent_rx_s):
+            if defer:
+                self._enqueue_pending_sync(peer_label=peer_label, channel=channel, dest_node_id=default_peer.node_id,
+                                           last_n=last_n, reason="manual_chan_link_gate")
+            return
+
+        if defer:
+            self._enqueue_pending_sync(peer_label=peer_label, channel=channel, dest_node_id=default_peer.node_id,
+                                       last_n=last_n, reason="manual_chan_deferred")
+            self._emit_status(f"Sync deferred for {channel} from {peer_label} (policy)")
             return
 
         try:
@@ -950,7 +1005,223 @@ class MeshChatBackend(BackendInterface):
             self._ui_queue.put(ChannelListEvent(channels=new_list))
 
     # ----------------------------------------------------------
+    # Channel-scoped sync policy helpers (Feature #4)
+    # ----------------------------------------------------------
+
+    def _get_sync_policy(self, channel: str):
+        """Best-effort policy resolution from config (no assumptions)."""
+        try:
+            cfg = self._config
+            getter = getattr(cfg, "get_channel_sync_policy", None)
+            if callable(getter):
+                return getter(channel)
+        except (AttributeError, TypeError, ValueError):
+            pass
+        return None
+
+    def _policy_effective_enabled(self, channel: str) -> bool:
+        pol = self._get_sync_policy(channel)
+        if pol is None:
+            return bool(getattr(self._config, "sync_enabled", True))
+        enabled = getattr(pol, "enabled", None)
+        if enabled is None:
+            return bool(getattr(self._config, "sync_enabled", True))
+        return bool(enabled)
+
+    def _policy_last_n(self, channel: str) -> int:
+        pol = self._get_sync_policy(channel)
+        if pol is not None:
+            ln = getattr(pol, "last_n_messages", None)
+            if ln is not None:
+                try:
+                    v = int(ln)
+                except (TypeError, ValueError):
+                    v = 0
+                if v < 0:
+                    v = 0
+                return v
+        try:
+            v = int(getattr(self._config, "sync_last_n_messages", 200))
+        except (TypeError, ValueError):
+            v = 200
+        if v < 0:
+            v = 0
+        return v
+
+    def _policy_min_interval(self, channel: str) -> float:
+        pol = self._get_sync_policy(channel)
+        if pol is not None:
+            mi = getattr(pol, "min_interval_seconds", None)
+            if mi is not None:
+                try:
+                    v = float(mi)
+                except (TypeError, ValueError):
+                    v = 0.0
+                if v < 0.0:
+                    v = 0.0
+                return v
+        try:
+            v = float(getattr(self._config, "sync_min_sync_interval_seconds", 30.0))
+        except (TypeError, ValueError):
+            v = 30.0
+        if v < 0.0:
+            v = 0.0
+        return v
+
+    def _policy_defer(self, channel: str) -> bool:
+        pol = self._get_sync_policy(channel)
+        if pol is None:
+            return False
+        dv = getattr(pol, "defer", None)
+        if dv is None:
+            return False
+        return bool(dv)
+
+    def _policy_require_recent_rx(self, channel: str) -> float:
+        pol = self._get_sync_policy(channel)
+        if pol is None:
+            return 0.0
+        rv = getattr(pol, "require_recent_rx_seconds", None)
+        if rv is None:
+            return 0.0
+        try:
+            v = float(rv)
+        except (TypeError, ValueError):
+            v = 0.0
+        if v < 0.0:
+            v = 0.0
+        return v
+
+    def _links_usable_for_policy(self, require_recent_rx_s: float) -> bool:
+        """Return True if link state looks usable for opportunistic sync.
+
+        Best-effort only: if metrics are unavailable, treat links as usable to avoid
+        surprising behavior changes.
+        """
+        if require_recent_rx_s <= 0.0:
+            return True
+
+        try:
+            metrics_list = self._client.get_link_metrics()
+        except (OSError, ValueError, AttributeError, TypeError):
+            return True
+
+        if not isinstance(metrics_list, list):
+            return True
+
+        now = time.time()
+
+        def any_recent(md: dict) -> bool:
+            try:
+                last_rx = md.get("last_rx_ts")
+            except (AttributeError, TypeError):
+                last_rx = None
+            if isinstance(last_rx, (int, float)) and float(last_rx) > 0:
+                age = max(0.0, now - float(last_rx))
+                return age <= require_recent_rx_s
+
+            # Some links may not have rx timestamps but can report connectivity.
+            try:
+                connected = bool(md.get("connected", False))
+            except (AttributeError, TypeError):
+                connected = False
+            return connected and require_recent_rx_s >= 3600.0  # only when user asked for a very loose gate
+
+        for mdict in metrics_list:
+            if isinstance(mdict, dict) and any_recent(mdict):
+                return True
+            # Multiplex link may have nested links
+            if isinstance(mdict, dict):
+                kids = mdict.get("child_links")
+                if kids is None:
+                    kids = mdict.get("links")
+                if isinstance(kids, list):
+                    for c in kids:
+                        if isinstance(c, dict) and any_recent(c):
+                            return True
+
+        return False
+
+    def _enqueue_pending_sync(self, peer_label: str, channel: str, dest_node_id: bytes, last_n: int,
+                              reason: str) -> None:
+        key = (str(peer_label), str(channel))
+        with self._pending_sync_lock:
+            self._pending_sync[key] = {
+                "peer_label": str(peer_label),
+                "channel": str(channel),
+                "dest_node_id": bytes(dest_node_id),
+                "last_n": int(last_n),
+                "reason": str(reason),
+                "queued_ts": time.time(),
+            }
+
+    def _drain_pending_sync(self) -> None:
+        """Attempt to send any deferred syncs when policy conditions allow."""
+
+        with self._pending_sync_lock:
+            # Force stable typing for IDEs/static checkers
+            items = list(self._pending_sync.items())
+
+        if not items:
+            return
+
+        now = time.time()
+        for key, item in items:
+            key_t: Tuple[str, str]
+            if isinstance(key, tuple) and len(key) == 2 and isinstance(key[0], str) and isinstance(key[1], str):
+                key_t = (key[0], key[1])
+            else:
+                continue
+
+            # Defensive: pending-sync entries must be dict-like
+            if not isinstance(item, dict):
+                continue
+
+            try:
+                peer_label = str(item.get("peer_label") or "")
+                channel = str(item.get("channel") or "")
+                dest_node_id = item.get("dest_node_id")
+                last_n = int(item.get("last_n", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+
+            if not peer_label or not channel:
+                continue
+
+            # Policy gate: per-channel enable/disable (defaults preserve current behavior)
+            if not self._policy_effective_enabled(channel):
+                # Drop the pending item silently; policy says this channel should not sync.
+                with self._pending_sync_lock:
+                    self._pending_sync.pop(key_t, None)
+                continue
+
+            # Cooldown gate: enforce per-channel minimum interval between sync attempts
+            min_interval = self._policy_min_interval(channel)
+            last_ts = self._last_sync_time.get((peer_label, channel))
+            if last_ts is not None and (now - float(last_ts)) < float(min_interval):
+                continue
+
+            # Opportunistic gating: if configured, require at least one link to have
+            # received something recently, otherwise keep deferred.
+            require_rx = self._policy_require_recent_rx(channel)
+            if require_rx is not None and require_rx > 0:
+                if not self._links_usable_for_policy(float(require_rx)):
+                    continue
+
+            try:
+                self._client.request_sync_last_n(dest_node_id=bytes(dest_node_id), channel=channel, last_n=last_n)
+                self._last_sync_time[(peer_label, channel)] = now
+                self._emit_status(f"Deferred sync sent for {channel} from {peer_label}")
+                self._schedule_sync_retry(peer_label=peer_label, channel=channel, dest_node_id=bytes(dest_node_id),
+                                          last_n=last_n)
+                with self._pending_sync_lock:
+                    self._pending_sync.pop(key_t, None)
+            except (OSError, ValueError, ArdopLinkError) as exc:
+                self._emit_status(f"Deferred sync failed for {channel} from {peer_label}: {exc}")
+
+    # ----------------------------------------------------------
     # Sync retry/backoff scheduler
+
     # ----------------------------------------------------------
 
     def _schedule_sync_retry(
@@ -1026,6 +1297,8 @@ class MeshChatBackend(BackendInterface):
                     self._sync_retry.clear()
                 continue
 
+            # Opportunistic sync: attempt any deferred syncs when conditions allow.
+            self._drain_pending_sync()
             now = time.time()
             due: List[_SyncRetryState] = []
 
@@ -1044,12 +1317,45 @@ class MeshChatBackend(BackendInterface):
                         self._emit_status(f"Sync retry gave up for {st.channel} from {st.peer_label}")
                     continue
 
+                # Channel-scoped policy gating (Feature #4)
+                if not self._policy_effective_enabled(st.channel):
+                    if not st.gave_up:
+                        st.gave_up = True
+                        self._emit_status(f"Sync disabled by policy for {st.channel} from {st.peer_label}")
+                    continue
+
+                # Respect channel-scoped min interval (cooldown) override
+                min_interval = self._policy_min_interval(st.channel)
+                cool_key = (st.peer_label, st.channel)
+                last_ts = self._last_sync_time.get(cool_key)
+                if last_ts is not None and (now - last_ts) < min_interval:
+                    st.next_due_ts = last_ts + min_interval
+                    continue
+
+                # Optional link gating (policy-controlled)
+                require_recent_rx_s = self._policy_require_recent_rx(st.channel)
+                if require_recent_rx_s > 0.0 and not self._links_usable_for_policy(require_recent_rx_s):
+                    if self._policy_defer(st.channel):
+                        self._enqueue_pending_sync(peer_label=st.peer_label, channel=st.channel,
+                                                   dest_node_id=st.dest_node_id, last_n=int(st.last_n),
+                                                   reason="retry_deferred")
+                    st.next_due_ts = now + self._compute_backoff_seconds(st)
+                    continue
+
+                if self._policy_defer(st.channel):
+                    self._enqueue_pending_sync(peer_label=st.peer_label, channel=st.channel,
+                                               dest_node_id=st.dest_node_id, last_n=int(st.last_n),
+                                               reason="retry_deferred")
+                    st.next_due_ts = now + self._compute_backoff_seconds(st)
+                    continue
+
                 try:
                     self._client.request_sync_last_n(
                         dest_node_id=st.dest_node_id,
                         channel=st.channel,
                         last_n=int(st.last_n),
                     )
+                    self._last_sync_time[(st.peer_label, st.channel)] = now
                 except (OSError, ValueError, ArdopLinkError) as exc:
                     # We still back off and retry; just report minimally.
                     self._emit_status(f"Sync retry failed for {st.channel} from {st.peer_label}: {exc}")

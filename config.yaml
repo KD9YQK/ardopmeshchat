@@ -18,7 +18,7 @@ security:
   enable_encryption: false
   key_hex: null
 chat:
-  node_mode: full   # full or relay or monitor
+  node_mode: full
   db_path: chat_logs.sqlite
   sync:
     enabled: true
@@ -31,6 +31,18 @@ chat:
       merge_distance: 0
       max_range_len: 50
       max_requests_per_trigger: 3
+    channel_policies:
+    - channel: '#general'
+      enabled: true
+      last_n_messages: 50
+      min_interval_seconds: 120
+      defer: true
+      require_recent_rx_seconds: 60
+    - channel: '@'
+      match_prefix: true
+      enabled: true
+      last_n_messages: 20
+      min_interval_seconds: 300
   peers:
     bob:
       node_id_hex: '0011223344556677'
