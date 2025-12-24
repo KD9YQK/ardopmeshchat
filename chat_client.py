@@ -83,6 +83,12 @@ class MeshChatConfig:
     sync_auto_sync_on_new_peer: bool = True
     sync_min_sync_interval_seconds: float = 30.0
 
+    # Message retention / expiry policy (Feature #6; local-only, protocol-neutral)
+    # Defaults preserve exact current behavior (no automatic deletion).
+    retention_enabled: bool = False
+    # If >0 and retention_enabled, messages older than this many days may be pruned locally.
+    retention_days: int = 0
+
     # Channel-scoped sync policies (Feature #4). Optional; defaults preserve current behavior.
     sync_channel_policies: List[ChannelSyncPolicy] = field(default_factory=list)
 
@@ -771,13 +777,27 @@ class MeshChatClient:
         return self._store.list_channels(limit=limit)
 
     def prune_db_keep_last_n_per_channel(self, keep_last_n: int) -> int:
-        """
-        Manually prune the local chat database. Keeps the most recent `keep_last_n`
-        messages per channel/DM.
+        """Manually prune the local chat database (local-only).
 
-        Returns number of rows deleted.
+        Keeps the most recent `keep_last_n` messages per channel/DM.
+
+        Returns: number of rows deleted.
         """
         return self._store.prune_keep_last_n_per_channel(int(keep_last_n))
+
+    def prune_db_older_than_days(self, days: int, channel: Optional[str] = None) -> int:
+        """Manually prune the local chat database by age (local-only).
+
+        Deletes messages with created_ts older than `days` days ago. If `channel` is provided,
+        only prunes that channel.
+
+        Returns: number of rows deleted.
+        """
+        return self._store.prune_older_than_seconds(int(days) * 86400, channel=channel)
+
+    def get_db_stats(self) -> dict:
+        """Return basic DB stats for diagnostics."""
+        return self._store.get_db_stats()
 
     def get_discovered_nodes(self) -> Dict[str, Tuple[bytes, float]]:
         """

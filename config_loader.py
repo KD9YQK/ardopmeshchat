@@ -282,6 +282,18 @@ def load_chat_config_from_yaml(path: str) -> MeshChatConfig:
     if node_mode not in {"full", "relay", "monitor"}:
         raise ValueError("chat.node_mode must be one of: full, relay, monitor")
 
+    # ---- retention config (optional; Feature #6 local-only) ----
+    retention_any = chat_cfg_raw.get("retention", {})
+    if not isinstance(retention_any, dict):
+        retention_raw: Dict[str, Any] = {}
+    else:
+        retention_raw = retention_any
+
+    retention_enabled = bool(retention_raw.get("enabled", False))
+    retention_days = int(retention_raw.get("days", 0) or 0)
+    if retention_days < 0:
+        raise ValueError("chat.retention.days must be >= 0")
+
     # ---- sync config (optional) ----
     sync_any = chat_cfg_raw.get("sync", {})
     if not isinstance(sync_any, dict):
@@ -412,6 +424,8 @@ def load_chat_config_from_yaml(path: str) -> MeshChatConfig:
         sync_max_send_per_response=sync_max_send_per_response,
         sync_auto_sync_on_new_peer=sync_auto_sync_on_new_peer,
         sync_min_sync_interval_seconds=sync_min_sync_interval_seconds,
+        retention_enabled=retention_enabled,
+        retention_days=retention_days,
         sync_channel_policies=channel_policies,
         targeted_sync_enabled=targeted_sync_enabled,
         targeted_sync_merge_distance=targeted_sync_merge_distance,

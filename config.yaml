@@ -20,6 +20,9 @@ security:
 chat:
   node_mode: full
   db_path: chat_logs.sqlite
+  retention:
+    enabled: false
+    days: 30
   sync:
     enabled: true
     last_n_messages: 200

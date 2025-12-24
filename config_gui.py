@@ -68,6 +68,10 @@ TOOLTIPS: Dict[str, str] = {
     "chat.db_path": "Path to the SQLite chat log database (relative paths resolve from the working directory).",
     "chat.node_mode": "Role-based node behavior. full=normal chat node; relay=mesh forwarder with chat/sync disabled; monitor=diagnostics-only (no chat/sync).",
 
+    "chat.retention": "Local-only message retention/expiry policy. Disabled by default; does not affect RF protocol, routing, or sync.",
+    "chat.retention.enabled": "Enable automatic local message expiry based on age. When false, nothing is deleted automatically.",
+    "chat.retention.days": "Retention window in days. Messages older than this may be deleted locally when retention is enabled. 0 disables age-based expiry.",
+
     "chat.sync": "Settings for message history synchronization between nodes.",
     "chat.sync.enabled": "Master toggle for sync logic. If false, the client will not request or respond with history sync data.",
     "chat.sync.last_n_messages": "How many recent messages to include per channel/DM when syncing (window size).",
@@ -763,6 +767,40 @@ class ConfigEditorDialog(wx.Dialog):
         vs.Add(self._make_labeled(panel, "Node mode", self.node_mode, TOOLTIPS["chat.node_mode"]), 0,
                wx.EXPAND | wx.ALL, 6)
 
+        # -----------------------
+        # Retention (Feature #6: local-only, disabled by default)
+        # -----------------------
+        retention_label = wx.StaticText(panel, label="Retention")
+        retention_label.SetToolTip(TOOLTIPS["chat.retention"])
+        vs.Add(retention_label, 0, wx.LEFT | wx.RIGHT | wx.TOP, 6)
+
+        retention_box = wx.StaticBoxSizer(wx.VERTICAL, panel, "")
+        retention_box.GetStaticBox().SetToolTip(TOOLTIPS["chat.retention"])
+
+        self.retention_enabled = wx.CheckBox(retention_box.GetStaticBox(), label="Enable retention (auto-expiry)")
+        self.retention_enabled.SetValue(bool(_deep_get(self.data, "chat.retention.enabled", False)))
+        self.retention_enabled.SetToolTip(TOOLTIPS["chat.retention.enabled"])
+        retention_box.Add(self.retention_enabled, 0, wx.ALL, 6)
+
+        self.retention_days = wx.SpinCtrl(
+            retention_box.GetStaticBox(),
+            min=0,
+            max=3650,
+            initial=int(_deep_get(self.data, "chat.retention.days", 0) or 0),
+        )
+        retention_box.Add(
+            self._make_labeled(
+                retention_box.GetStaticBox(),
+                "Retention days",
+                self.retention_days,
+                TOOLTIPS["chat.retention.days"],
+            ),
+            0,
+            wx.EXPAND | wx.ALL,
+            6,
+        )
+
+        vs.Add(retention_box, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 6)
         # -----------------------
         # Sync options
         # -----------------------
@@ -1491,6 +1529,10 @@ class ConfigEditorDialog(wx.Dialog):
 
         # chat.node_mode (Feature #3)
         _deep_set(self.data, "chat.node_mode", str(self.node_mode.GetStringSelection() or "full").strip().lower())
+
+        # chat.retention (Feature #6: local-only, policy-only)
+        _deep_set(self.data, "chat.retention.enabled", bool(self.retention_enabled.GetValue()))
+        _deep_set(self.data, "chat.retention.days", int(self.retention_days.GetValue()))
 
         # gui theme
         _deep_set(self.data, "gui.colors.window_bg", self._color_to_hex(self.gui_window_bg.GetColour()))

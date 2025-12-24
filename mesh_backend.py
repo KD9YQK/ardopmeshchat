@@ -137,6 +137,13 @@ class MeshChatBackend(BackendInterface):
         :param status_heartbeat_interval: if > 0, emits periodic StatusEvent heartbeats
         """
         self._config = config
+
+        # Feature #6: message retention (local-only). Defaults preserve behavior.
+        self._retention_enabled = bool(getattr(config, "retention_enabled", False))
+        self._retention_days = int(getattr(config, "retention_days", 0) or 0)
+        # Run retention maintenance at most once per hour when enabled.
+        self._retention_run_interval_seconds = 3600.0
+        self._last_retention_run_ts = 0.0
         try:
             self._node_mode = str(getattr(config, "node_mode", "full") or "full").strip().lower()
         except (AttributeError, TypeError, ValueError):
@@ -446,6 +453,12 @@ class MeshChatBackend(BackendInterface):
         # Local channels (from our cached view; derived from ChatStore via backend refresh)
         local_channels = list(self._last_channels) if isinstance(self._last_channels, list) else []
 
+        # DB stats (best-effort; local-only)
+        try:
+            db_stats = self._client.get_db_stats()
+        except (AttributeError, OSError, ValueError, TypeError):
+            db_stats = {"messages_total": 0, "channels": 0, "oldest_created_ts": None, "newest_created_ts": None}
+
         snap = {
             "diag_version": 1,
             "ts": int(now),
@@ -462,6 +475,11 @@ class MeshChatBackend(BackendInterface):
                 "peer_freshness_window_s": self._diagnostic_peer_window_s(),
             },
             "links": link_metrics,
+            "retention": {
+                "enabled": bool(self._retention_enabled),
+                "days": int(self._retention_days),
+                "last_run_ts": int(self._last_retention_run_ts) if self._last_retention_run_ts else None,
+            },
             "sync": {
                 "cooldowns_tracked": int(len(self._last_sync_time)) if isinstance(self._last_sync_time, dict) else 0,
                 "retries_tracked": int(len(retries)),
@@ -470,6 +488,10 @@ class MeshChatBackend(BackendInterface):
             "db": {
                 "local_channels_count": int(len(local_channels)),
                 "local_channels": local_channels[:25],  # cap
+                "messages_total": int(db_stats.get("messages_total", 0) or 0),
+                "distinct_channels": int(db_stats.get("channels", 0) or 0),
+                "oldest_created_ts": db_stats.get("oldest_created_ts"),
+                "newest_created_ts": db_stats.get("newest_created_ts"),
             },
         }
         return snap
@@ -804,6 +826,30 @@ class MeshChatBackend(BackendInterface):
         except (OSError, ValueError, ArdopLinkError) as exc:
             self._emit_status(f"Targeted sync request failed for {callsign}: {exc}")
 
+    def _maybe_run_retention_maintenance(self) -> None:
+        """Best-effort local message expiry (Feature #6).
+
+        No protocol/routing/sync changes. Only local storage is pruned, and only when explicitly enabled.
+        """
+        if not self._retention_enabled:
+            return
+        if self._retention_days <= 0:
+            return
+
+        now = time.time()
+        if (now - float(self._last_retention_run_ts)) < float(self._retention_run_interval_seconds):
+            return
+
+        self._last_retention_run_ts = now
+
+        try:
+            deleted = self._client.prune_db_older_than_days(self._retention_days)
+        except (OSError, ValueError, AttributeError, TypeError):
+            return
+
+        if deleted > 0:
+            self._emit_status(f"Retention: pruned {deleted} msgs older than {self._retention_days}d")
+
     def _status_loop(self) -> None:
         while self._running:
             time.sleep(self._status_interval)
@@ -812,6 +858,9 @@ class MeshChatBackend(BackendInterface):
 
             # Feature #2: structured diagnostics snapshot (human + machine stable)
             self._emit_structured_diagnostics()
+
+            # Feature #6: local retention maintenance (optional)
+            self._maybe_run_retention_maintenance()
 
             # Per-link health/metrics snapshot (best-effort, no protocol changes)
             try:
@@ -1045,9 +1094,9 @@ class MeshChatBackend(BackendInterface):
             self._last_channels = new_list
             self._ui_queue.put(ChannelListEvent(channels=new_list))
 
-    # ----------------------------------------------------------
-    # Channel-scoped sync policy helpers (Feature #4)
-    # ----------------------------------------------------------
+        # ----------------------------------------------------------
+        # Channel-scoped sync policy helpers (Feature #4)
+        # ----------------------------------------------------------
 
     def _get_sync_policy(self, channel: str):
         """Best-effort policy resolution from config (no assumptions)."""
@@ -1183,9 +1232,9 @@ class MeshChatBackend(BackendInterface):
 
         return False
 
-    # ----------------------------------------------------------
-    # Feature #5: Offline peer awareness + soft link-cost (policy-only)
-    # ----------------------------------------------------------
+        # ----------------------------------------------------------
+        # Feature #5: Offline peer awareness + soft link-cost (policy-only)
+        # ----------------------------------------------------------
 
     def _peer_last_seen_age_s(self, peer_label: str) -> Optional[float]:
         """Best-effort last-seen age for a peer (derived from discovery state).
@@ -1354,10 +1403,10 @@ class MeshChatBackend(BackendInterface):
             except (OSError, ValueError, ArdopLinkError) as exc:
                 self._emit_status(f"Deferred sync failed for {channel} from {peer_label}: {exc}")
 
-    # ----------------------------------------------------------
-    # Sync retry/backoff scheduler
+        # ----------------------------------------------------------
+        # Sync retry/backoff scheduler
 
-    # ----------------------------------------------------------
+        # ----------------------------------------------------------
 
     def _schedule_sync_retry(
             self,
