@@ -178,6 +178,7 @@ class ChatStore:
         rows = cur.fetchall()
         rows.sort(key=lambda r: (r[6], r[0]))
         return [(r[1], int(r[2]), r[3], r[4], r[5], float(r[6])) for r in rows]
+
     def get_messages_for_origin_seq_range(
             self,
             channel: str,
@@ -208,9 +209,6 @@ class ChatStore:
         )
         rows = cur.fetchall()
         return [(r[0], int(r[1]), r[2], r[3], r[4], float(r[5])) for r in rows]
-
-
-
 
     def list_channels(self, limit: int = 50) -> List[str]:
         """
@@ -258,6 +256,57 @@ class ChatStore:
 
         self._conn.commit()
         return deleted_total
+
+    def prune_older_than_seconds(self, older_than_seconds: int, channel: Optional[str] = None) -> int:
+        """Prune messages older than a threshold (local-only).
+
+        Deletes rows where created_ts < (now - older_than_seconds). If `channel` is provided,
+        restricts deletion to that channel.
+
+        Returns number of rows deleted.
+        """
+        secs = int(older_than_seconds)
+        if secs <= 0:
+            return 0
+        cutoff = int(time.time()) - secs
+
+        if channel is None:
+            cur = self._conn.execute(
+                "DELETE FROM chat_messages WHERE created_ts < ?",
+                (cutoff,),
+            )
+        else:
+            cur = self._conn.execute(
+                "DELETE FROM chat_messages WHERE created_ts < ? AND channel = ?",
+                (cutoff, str(channel)),
+            )
+
+        self._conn.commit()
+        try:
+            return int(cur.rowcount or 0)
+        except Exception:
+            return 0
+
+    def get_db_stats(self) -> dict:
+        """Return basic DB stats for diagnostics (local-only)."""
+        try:
+            cur = self._conn.execute(
+                "SELECT COUNT(*), COUNT(DISTINCT channel), MIN(created_ts), MAX(created_ts) FROM chat_messages"
+            )
+            row = cur.fetchone()
+        except sqlite3.Error:
+            row = None
+
+        if not row:
+            return {"messages_total": 0, "channels": 0, "oldest_created_ts": None, "newest_created_ts": None}
+
+        total, chans, oldest, newest = row
+        return {
+            "messages_total": int(total or 0),
+            "channels": int(chans or 0),
+            "oldest_created_ts": int(oldest) if oldest is not None else None,
+            "newest_created_ts": int(newest) if newest is not None else None,
+        }
 
     def close(self) -> None:
         self._conn.close()

@@ -68,12 +68,25 @@ TOOLTIPS: Dict[str, str] = {
     "chat.db_path": "Path to the SQLite chat log database (relative paths resolve from the working directory).",
     "chat.node_mode": "Role-based node behavior. full=normal chat node; relay=mesh forwarder with chat/sync disabled; monitor=diagnostics-only (no chat/sync).",
 
+    "chat.retention": "Local-only message retention/expiry policy. Disabled by default; does not affect RF protocol, routing, or sync.",
+    "chat.retention.enabled": "Enable automatic local message expiry based on age. When false, nothing is deleted automatically.",
+    "chat.retention.days": "Retention window in days. Messages older than this may be deleted locally when retention is enabled. 0 disables age-based expiry.",
+
     "chat.sync": "Settings for message history synchronization between nodes.",
     "chat.sync.enabled": "Master toggle for sync logic. If false, the client will not request or respond with history sync data.",
     "chat.sync.last_n_messages": "How many recent messages to include per channel/DM when syncing (window size).",
     "chat.sync.max_send_per_response": "Maximum messages to include in any single sync response (caps burst size).",
     "chat.sync.auto_sync_on_new_peer": "If true, automatically initiate sync when a new peer is discovered.",
     "chat.sync.min_sync_interval_seconds": "Minimum seconds between sync attempts for the same peer/channel (cooldown).",
+
+    "chat.sync.channel_policies": "Optional per-channel sync policy overrides. Each entry can enable/disable sync for a channel, adjust last-N window, set cooldowns, and optionally defer sync until conditions are good.",
+    "chat.sync.channel_policy.channel": "Channel name to match (e.g., '#general' or '@bob').",
+    "chat.sync.channel_policy.match_prefix": "If true, this policy applies to any channel that starts with the given channel string (prefix match). Useful for applying one policy to all DMs (e.g., '@').",
+    "chat.sync.channel_policy.enabled": "Override sync enabled for this channel. default=use global chat.sync.enabled.",
+    "chat.sync.channel_policy.defer": "If true, sync for this channel may be queued and sent opportunistically instead of immediately. default=use global behavior.",
+    "chat.sync.channel_policy.min_interval_seconds": "Per-channel minimum seconds between sync attempts (cooldown). Blank/default uses chat.sync.min_sync_interval_seconds.",
+    "chat.sync.channel_policy.last_n_messages": "Per-channel last-N window for sync inventory/requests. Blank/default uses chat.sync.last_n_messages.",
+    "chat.sync.channel_policy.require_recent_rx_seconds": "If set, only attempt sync when at least one link has received data within this many seconds. Blank/default disables this gate.",
 
     "chat.sync.targeted_sync": "Targeted sync (range-based) tuning. Controls how confirmed gaps are turned into range sync requests.",
     "chat.sync.targeted_sync.enabled": "Enable targeted (range-based) sync. If false, the node will not issue range sync requests.",
@@ -165,6 +178,17 @@ class TcpLinkRow:
     reconnect_base_delay: float
     reconnect_max_delay: float
     tx_queue_size: int
+
+
+@dataclass
+class ChannelPolicyRow:
+    channel: str
+    match_prefix: bool
+    enabled: Optional[bool]  # None = default
+    defer: Optional[bool]  # None = default
+    min_interval_seconds: Optional[float]
+    last_n_messages: Optional[int]
+    require_recent_rx_seconds: Optional[float]
 
 
 class PeerEditDialog(wx.Dialog):
@@ -341,6 +365,175 @@ class TcpLinkEditDialog(wx.Dialog):
             reconnect_base_delay=float(self.reconnect_base_ctrl.GetValue().strip()),
             reconnect_max_delay=float(self.reconnect_max_ctrl.GetValue().strip()),
             tx_queue_size=int(self.tx_queue_ctrl.GetValue()),
+        )
+
+
+class ChannelPolicyEditDialog(wx.Dialog):
+    def __init__(self, parent: wx.Window, title: str, initial: Optional[ChannelPolicyRow] = None) -> None:
+        super().__init__(parent, title=title, style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
+        sizer = wx.BoxSizer(wx.VERTICAL)
+
+        grid = wx.FlexGridSizer(rows=7, cols=2, vgap=8, hgap=8)
+        grid.AddGrowableCol(1, 1)
+
+        self.channel_ctrl = wx.TextCtrl(self)
+        self.channel_ctrl.SetToolTip(TOOLTIPS["chat.sync.channel_policy.channel"])
+
+        self.match_prefix_ctrl = wx.CheckBox(self, label="")
+        self.match_prefix_ctrl.SetToolTip(TOOLTIPS["chat.sync.channel_policy.match_prefix"])
+
+        # Tri-state via Choice: default/true/false
+        self.enabled_ctrl = wx.Choice(self, choices=["default", "enabled", "disabled"])
+        self.enabled_ctrl.SetToolTip(TOOLTIPS["chat.sync.channel_policy.enabled"])
+
+        self.defer_ctrl = wx.Choice(self, choices=["default", "defer", "no-defer"])
+        self.defer_ctrl.SetToolTip(TOOLTIPS["chat.sync.channel_policy.defer"])
+
+        self.min_interval_ctrl = wx.TextCtrl(self, value="")
+        self.min_interval_ctrl.SetToolTip(TOOLTIPS["chat.sync.channel_policy.min_interval_seconds"])
+
+        self.last_n_ctrl = wx.TextCtrl(self, value="")
+        self.last_n_ctrl.SetToolTip(TOOLTIPS["chat.sync.channel_policy.last_n_messages"])
+
+        self.require_recent_rx_ctrl = wx.TextCtrl(self, value="")
+        self.require_recent_rx_ctrl.SetToolTip(TOOLTIPS["chat.sync.channel_policy.require_recent_rx_seconds"])
+
+        grid.Add(wx.StaticText(self, label="Channel"), 0, wx.ALIGN_CENTER_VERTICAL)
+        grid.Add(self.channel_ctrl, 1, wx.EXPAND)
+
+        grid.Add(wx.StaticText(self, label="Match prefix"), 0, wx.ALIGN_CENTER_VERTICAL)
+        grid.Add(self.match_prefix_ctrl, 0, wx.ALIGN_CENTER_VERTICAL)
+
+        grid.Add(wx.StaticText(self, label="Enabled"), 0, wx.ALIGN_CENTER_VERTICAL)
+        grid.Add(self.enabled_ctrl, 0)
+
+        grid.Add(wx.StaticText(self, label="Defer"), 0, wx.ALIGN_CENTER_VERTICAL)
+        grid.Add(self.defer_ctrl, 0)
+
+        grid.Add(wx.StaticText(self, label="Min interval (s)"), 0, wx.ALIGN_CENTER_VERTICAL)
+        grid.Add(self.min_interval_ctrl, 1, wx.EXPAND)
+
+        grid.Add(wx.StaticText(self, label="Last N messages"), 0, wx.ALIGN_CENTER_VERTICAL)
+        grid.Add(self.last_n_ctrl, 1, wx.EXPAND)
+
+        grid.Add(wx.StaticText(self, label="Require recent RX (s)"), 0, wx.ALIGN_CENTER_VERTICAL)
+        grid.Add(self.require_recent_rx_ctrl, 1, wx.EXPAND)
+
+        sizer.Add(grid, 0, wx.EXPAND | wx.ALL, 12)
+
+        btns = self.CreateSeparatedButtonSizer(wx.OK | wx.CANCEL)
+        if btns:
+            sizer.Add(btns, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 12)
+
+        self.SetSizerAndFit(sizer)
+        self.SetMinSize(wx.Size(520, -1))
+
+        # Defaults
+        self.enabled_ctrl.SetSelection(0)
+        self.defer_ctrl.SetSelection(0)
+
+        if initial:
+            self.channel_ctrl.SetValue(initial.channel)
+            self.match_prefix_ctrl.SetValue(bool(initial.match_prefix))
+
+            if initial.enabled is None:
+                self.enabled_ctrl.SetSelection(0)
+            elif initial.enabled:
+                self.enabled_ctrl.SetSelection(1)
+            else:
+                self.enabled_ctrl.SetSelection(2)
+
+            if initial.defer is None:
+                self.defer_ctrl.SetSelection(0)
+            elif initial.defer:
+                self.defer_ctrl.SetSelection(1)
+            else:
+                self.defer_ctrl.SetSelection(2)
+
+            self.min_interval_ctrl.SetValue(
+                "" if initial.min_interval_seconds is None else str(initial.min_interval_seconds))
+            self.last_n_ctrl.SetValue("" if initial.last_n_messages is None else str(initial.last_n_messages))
+            self.require_recent_rx_ctrl.SetValue(
+                "" if initial.require_recent_rx_seconds is None else str(initial.require_recent_rx_seconds))
+
+        self.Bind(wx.EVT_BUTTON, self._on_ok, id=wx.ID_OK)
+
+    @staticmethod
+    def _parse_optional_float(label: str, raw: str) -> Optional[float]:
+        s = raw.strip()
+        if s == "":
+            return None
+        try:
+            v = float(s)
+        except ValueError:
+            raise ValueError(f"{label} must be a number") from None
+        if v < 0.0:
+            raise ValueError(f"{label} must be >= 0")
+        return v
+
+    @staticmethod
+    def _parse_optional_int(label: str, raw: str) -> Optional[int]:
+        s = raw.strip()
+        if s == "":
+            return None
+        try:
+            v = int(s, 10)
+        except ValueError:
+            raise ValueError(f"{label} must be an integer") from None
+        if v < 0:
+            raise ValueError(f"{label} must be >= 0")
+        return v
+
+    def _on_ok(self, _event: wx.CommandEvent) -> None:
+        channel = self.channel_ctrl.GetValue().strip()
+        if not channel:
+            wx.MessageBox("Channel cannot be empty.", "Validation", wx.ICON_WARNING)
+            return
+
+        try:
+            _ = self._parse_optional_float("Min interval (s)", self.min_interval_ctrl.GetValue())
+            _ = self._parse_optional_int("Last N messages", self.last_n_ctrl.GetValue())
+            _ = self._parse_optional_float("Require recent RX (s)", self.require_recent_rx_ctrl.GetValue())
+        except ValueError as e:
+            wx.MessageBox(str(e), "Validation", wx.ICON_WARNING)
+            return
+
+        self.EndModal(wx.ID_OK)
+
+    def get_policy(self) -> ChannelPolicyRow:
+        channel = self.channel_ctrl.GetValue().strip()
+        match_prefix = bool(self.match_prefix_ctrl.GetValue())
+
+        enabled_sel = int(self.enabled_ctrl.GetSelection())
+        enabled: Optional[bool]
+        if enabled_sel == 0:
+            enabled = None
+        elif enabled_sel == 1:
+            enabled = True
+        else:
+            enabled = False
+
+        defer_sel = int(self.defer_ctrl.GetSelection())
+        defer: Optional[bool]
+        if defer_sel == 0:
+            defer = None
+        elif defer_sel == 1:
+            defer = True
+        else:
+            defer = False
+
+        min_interval = self._parse_optional_float("Min interval (s)", self.min_interval_ctrl.GetValue())
+        last_n = self._parse_optional_int("Last N messages", self.last_n_ctrl.GetValue())
+        require_recent_rx = self._parse_optional_float("Require recent RX (s)", self.require_recent_rx_ctrl.GetValue())
+
+        return ChannelPolicyRow(
+            channel=channel,
+            match_prefix=match_prefix,
+            enabled=enabled,
+            defer=defer,
+            min_interval_seconds=min_interval,
+            last_n_messages=last_n,
+            require_recent_rx_seconds=require_recent_rx,
         )
 
 
@@ -575,6 +768,40 @@ class ConfigEditorDialog(wx.Dialog):
                wx.EXPAND | wx.ALL, 6)
 
         # -----------------------
+        # Retention (Feature #6: local-only, disabled by default)
+        # -----------------------
+        retention_label = wx.StaticText(panel, label="Retention")
+        retention_label.SetToolTip(TOOLTIPS["chat.retention"])
+        vs.Add(retention_label, 0, wx.LEFT | wx.RIGHT | wx.TOP, 6)
+
+        retention_box = wx.StaticBoxSizer(wx.VERTICAL, panel, "")
+        retention_box.GetStaticBox().SetToolTip(TOOLTIPS["chat.retention"])
+
+        self.retention_enabled = wx.CheckBox(retention_box.GetStaticBox(), label="Enable retention (auto-expiry)")
+        self.retention_enabled.SetValue(bool(_deep_get(self.data, "chat.retention.enabled", False)))
+        self.retention_enabled.SetToolTip(TOOLTIPS["chat.retention.enabled"])
+        retention_box.Add(self.retention_enabled, 0, wx.ALL, 6)
+
+        self.retention_days = wx.SpinCtrl(
+            retention_box.GetStaticBox(),
+            min=0,
+            max=3650,
+            initial=int(_deep_get(self.data, "chat.retention.days", 0) or 0),
+        )
+        retention_box.Add(
+            self._make_labeled(
+                retention_box.GetStaticBox(),
+                "Retention days",
+                self.retention_days,
+                TOOLTIPS["chat.retention.days"],
+            ),
+            0,
+            wx.EXPAND | wx.ALL,
+            6,
+        )
+
+        vs.Add(retention_box, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 6)
+        # -----------------------
         # Sync options
         # -----------------------
         sync_label = wx.StaticText(panel, label="Sync")
@@ -681,6 +908,43 @@ class ConfigEditorDialog(wx.Dialog):
         )
 
         vs.Add(targeted_box, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 6)
+
+        # -----------------------
+        # Channel-scoped sync policies (Feature #4)
+        # -----------------------
+        policies_label = wx.StaticText(panel, label="Channel sync policies")
+        policies_label.SetToolTip(TOOLTIPS["chat.sync.channel_policies"])
+        vs.Add(policies_label, 0, wx.LEFT | wx.RIGHT | wx.TOP, 6)
+
+        phs = wx.BoxSizer(wx.HORIZONTAL)
+
+        self.channel_policies_list = wx.ListCtrl(panel, style=wx.LC_REPORT | wx.LC_SINGLE_SEL)
+        self.channel_policies_list.InsertColumn(0, "Channel", width=170)
+        self.channel_policies_list.InsertColumn(1, "Prefix", width=70)
+        self.channel_policies_list.InsertColumn(2, "Enabled", width=90)
+        self.channel_policies_list.InsertColumn(3, "Defer", width=80)
+        self.channel_policies_list.InsertColumn(4, "LastN", width=80)
+        self.channel_policies_list.InsertColumn(5, "MinInt", width=80)
+        self.channel_policies_list.InsertColumn(6, "ReqRX", width=80)
+        self.channel_policies_list.SetToolTip(TOOLTIPS["chat.sync.channel_policies"])
+        phs.Add(self.channel_policies_list, 1, wx.EXPAND | wx.ALL, 6)
+
+        pbtns = wx.BoxSizer(wx.VERTICAL)
+        self.btn_add_channel_policy = wx.Button(panel, label="Add…")
+        self.btn_edit_channel_policy = wx.Button(panel, label="Edit…")
+        self.btn_remove_channel_policy = wx.Button(panel, label="Remove")
+        pbtns.Add(self.btn_add_channel_policy, 0, wx.EXPAND | wx.BOTTOM, 6)
+        pbtns.Add(self.btn_edit_channel_policy, 0, wx.EXPAND | wx.BOTTOM, 6)
+        pbtns.Add(self.btn_remove_channel_policy, 0, wx.EXPAND)
+        phs.Add(pbtns, 0, wx.TOP | wx.RIGHT | wx.BOTTOM, 6)
+
+        vs.Add(phs, 0, wx.EXPAND)
+
+        self.btn_add_channel_policy.Bind(wx.EVT_BUTTON, self._on_add_channel_policy)
+        self.btn_edit_channel_policy.Bind(wx.EVT_BUTTON, self._on_edit_channel_policy)
+        self.btn_remove_channel_policy.Bind(wx.EVT_BUTTON, self._on_remove_channel_policy)
+
+        self._load_channel_policies_into_list()
 
         peers_label = wx.StaticText(panel, label="Peers")
         peers_label.SetToolTip(TOOLTIPS["chat.peers"])
@@ -890,6 +1154,160 @@ class ConfigEditorDialog(wx.Dialog):
             peers.pop(key, None)
             _deep_set(self.data, "chat.peers", peers)
         self._load_peers_into_list()
+
+    # ----------------------------------------------------------
+    # Channel sync policy list helpers (Feature #4)
+    # ----------------------------------------------------------
+
+    def _load_channel_policies_into_list(self) -> None:
+        if not hasattr(self, "channel_policies_list"):
+            return
+        self.channel_policies_list.DeleteAllItems()
+        policies = _deep_get(self.data, "chat.sync.channel_policies", []) or []
+        if not isinstance(policies, list):
+            policies = []
+
+        for i, entry in enumerate(policies):
+            if not isinstance(entry, dict):
+                continue
+            chan = str(entry.get("channel", f"policy-{i}") or f"policy-{i}")
+            prefix = "yes" if bool(entry.get("match_prefix", False)) else "no"
+
+            def _fmt_tri(v_any: Any) -> str:
+                if v_any is None:
+                    return "default"
+                return "yes" if bool(v_any) else "no"
+
+            enabled = _fmt_tri(entry.get("enabled", None))
+            defer = _fmt_tri(entry.get("defer", None))
+
+            last_n_any = entry.get("last_n_messages", None)
+            last_n = "" if last_n_any is None else str(last_n_any)
+
+            min_int_any = entry.get("min_interval_seconds", None)
+            min_int = "" if min_int_any is None else str(min_int_any)
+
+            rx_any = entry.get("require_recent_rx_seconds", None)
+            rx = "" if rx_any is None else str(rx_any)
+
+            idx_row = self.channel_policies_list.InsertItem(self.channel_policies_list.GetItemCount(), chan)
+            self.channel_policies_list.SetItem(idx_row, 1, prefix)
+            self.channel_policies_list.SetItem(idx_row, 2, enabled)
+            self.channel_policies_list.SetItem(idx_row, 3, defer)
+            self.channel_policies_list.SetItem(idx_row, 4, last_n)
+            self.channel_policies_list.SetItem(idx_row, 5, min_int)
+            self.channel_policies_list.SetItem(idx_row, 6, rx)
+
+    def _get_selected_channel_policy_index(self) -> Optional[int]:
+        if not hasattr(self, "channel_policies_list"):
+            return None
+        idx_sel = self.channel_policies_list.GetFirstSelected()
+        if idx_sel == -1:
+            return None
+        return int(idx_sel)
+
+    def _on_add_channel_policy(self, _event: wx.CommandEvent) -> None:
+        dlg = ChannelPolicyEditDialog(self, "Add Channel Policy")
+        try:
+            if dlg.ShowModal() != wx.ID_OK:
+                return
+            row = dlg.get_policy()
+        finally:
+            dlg.Destroy()
+
+        policies = _deep_get(self.data, "chat.sync.channel_policies", []) or []
+        if not isinstance(policies, list):
+            policies = []
+
+        entry: Dict[str, Any] = {"channel": row.channel}
+        if row.match_prefix:
+            entry["match_prefix"] = True
+        if row.enabled is not None:
+            entry["enabled"] = bool(row.enabled)
+        if row.defer is not None:
+            entry["defer"] = bool(row.defer)
+        if row.min_interval_seconds is not None:
+            entry["min_interval_seconds"] = float(row.min_interval_seconds)
+        if row.last_n_messages is not None:
+            entry["last_n_messages"] = int(row.last_n_messages)
+        if row.require_recent_rx_seconds is not None:
+            entry["require_recent_rx_seconds"] = float(row.require_recent_rx_seconds)
+
+        policies.append(entry)
+        _deep_set(self.data, "chat.sync.channel_policies", policies)
+        self._load_channel_policies_into_list()
+
+    def _on_edit_channel_policy(self, _event: wx.CommandEvent) -> None:
+        sel = self._get_selected_channel_policy_index()
+        if sel is None:
+            return
+
+        policies = _deep_get(self.data, "chat.sync.channel_policies", []) or []
+        if not isinstance(policies, list) or sel < 0 or sel >= len(policies):
+            return
+        entry = policies[sel]
+        if not isinstance(entry, dict):
+            return
+
+        initial = ChannelPolicyRow(
+            channel=str(entry.get("channel", "") or ""),
+            match_prefix=bool(entry.get("match_prefix", False)),
+            enabled=None if entry.get("enabled", None) is None else bool(entry.get("enabled", False)),
+            defer=None if entry.get("defer", None) is None else bool(entry.get("defer", False)),
+            min_interval_seconds=None if entry.get("min_interval_seconds", None) is None else float(
+                entry.get("min_interval_seconds")),
+            last_n_messages=None if entry.get("last_n_messages", None) is None else int(entry.get("last_n_messages")),
+            require_recent_rx_seconds=None if entry.get("require_recent_rx_seconds", None) is None else float(
+                entry.get("require_recent_rx_seconds")),
+        )
+
+        dlg = ChannelPolicyEditDialog(self, "Edit Channel Policy", initial=initial)
+        try:
+            if dlg.ShowModal() != wx.ID_OK:
+                return
+            row = dlg.get_policy()
+        finally:
+            dlg.Destroy()
+
+        new_entry: Dict[str, Any] = {"channel": row.channel}
+        if row.match_prefix:
+            new_entry["match_prefix"] = True
+        if row.enabled is not None:
+            new_entry["enabled"] = bool(row.enabled)
+        if row.defer is not None:
+            new_entry["defer"] = bool(row.defer)
+        if row.min_interval_seconds is not None:
+            new_entry["min_interval_seconds"] = float(row.min_interval_seconds)
+        if row.last_n_messages is not None:
+            new_entry["last_n_messages"] = int(row.last_n_messages)
+        if row.require_recent_rx_seconds is not None:
+            new_entry["require_recent_rx_seconds"] = float(row.require_recent_rx_seconds)
+
+        policies[sel] = new_entry
+        _deep_set(self.data, "chat.sync.channel_policies", policies)
+        self._load_channel_policies_into_list()
+
+    def _on_remove_channel_policy(self, _event: wx.CommandEvent) -> None:
+        sel = self._get_selected_channel_policy_index()
+        if sel is None:
+            return
+
+        policies = _deep_get(self.data, "chat.sync.channel_policies", []) or []
+        if not isinstance(policies, list) or sel < 0 or sel >= len(policies):
+            return
+
+        entry = policies[sel]
+        chan = str(entry.get("channel", "") or "") if isinstance(entry, dict) else ""
+        if wx.MessageBox(
+                f"Remove channel policy '{chan}'?",
+                "Confirm",
+                wx.YES_NO | wx.NO_DEFAULT | wx.ICON_QUESTION,
+        ) != wx.YES:
+            return
+
+        del policies[sel]
+        _deep_set(self.data, "chat.sync.channel_policies", policies)
+        self._load_channel_policies_into_list()
 
     # ----------------------------------------------------------
     # TCP link list helpers
@@ -1111,6 +1529,10 @@ class ConfigEditorDialog(wx.Dialog):
 
         # chat.node_mode (Feature #3)
         _deep_set(self.data, "chat.node_mode", str(self.node_mode.GetStringSelection() or "full").strip().lower())
+
+        # chat.retention (Feature #6: local-only, policy-only)
+        _deep_set(self.data, "chat.retention.enabled", bool(self.retention_enabled.GetValue()))
+        _deep_set(self.data, "chat.retention.days", int(self.retention_days.GetValue()))
 
         # gui theme
         _deep_set(self.data, "gui.colors.window_bg", self._color_to_hex(self.gui_window_bg.GetColour()))

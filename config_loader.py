@@ -22,7 +22,7 @@ from mesh_config import (
     TcpMeshServerConfig,
     TcpMeshLinkConfig,
 )
-from chat_client import MeshChatConfig, ChatPeer  # if you're using chat
+from chat_client import MeshChatConfig, ChatPeer, ChannelSyncPolicy  # if you're using chat
 
 
 # ---------------------------------------------------------------------------
@@ -282,6 +282,18 @@ def load_chat_config_from_yaml(path: str) -> MeshChatConfig:
     if node_mode not in {"full", "relay", "monitor"}:
         raise ValueError("chat.node_mode must be one of: full, relay, monitor")
 
+    # ---- retention config (optional; Feature #6 local-only) ----
+    retention_any = chat_cfg_raw.get("retention", {})
+    if not isinstance(retention_any, dict):
+        retention_raw: Dict[str, Any] = {}
+    else:
+        retention_raw = retention_any
+
+    retention_enabled = bool(retention_raw.get("enabled", False))
+    retention_days = int(retention_raw.get("days", 0) or 0)
+    if retention_days < 0:
+        raise ValueError("chat.retention.days must be >= 0")
+
     # ---- sync config (optional) ----
     sync_any = chat_cfg_raw.get("sync", {})
     if not isinstance(sync_any, dict):
@@ -320,6 +332,59 @@ def load_chat_config_from_yaml(path: str) -> MeshChatConfig:
         raise ValueError("chat.sync.targeted_sync.max_range_len must be >= 1")
     if targeted_sync_max_requests_per_trigger < 1:
         raise ValueError("chat.sync.targeted_sync.max_requests_per_trigger must be >= 1")
+
+    # ---- channel-scoped sync policy overrides (Feature #4; optional) ----
+    channel_policies_any = sync_raw.get("channel_policies", [])
+    if channel_policies_any is None:
+        channel_policies_any = []
+    if not isinstance(channel_policies_any, list):
+        raise ValueError("chat.sync.channel_policies must be a list")
+
+    channel_policies: List[ChannelSyncPolicy] = []
+    for entry_any in channel_policies_any:
+        if not isinstance(entry_any, dict):
+            raise ValueError("Each chat.sync.channel_policies entry must be a mapping")
+
+        chan_key = entry_any.get("channel")
+        if chan_key is None:
+            raise ValueError("Each chat.sync.channel_policies entry must include 'channel'")
+        chan = str(chan_key)
+
+        match_prefix = bool(entry_any.get("match_prefix", False))
+
+        enabled_any = entry_any.get("enabled", None)
+        enabled = None if enabled_any is None else bool(enabled_any)
+
+        defer_any = entry_any.get("defer", None)
+        defer = None if defer_any is None else bool(defer_any)
+
+        min_int_any = entry_any.get("min_interval_seconds", None)
+        min_interval_seconds = None if min_int_any is None else float(min_int_any)
+        if min_interval_seconds is not None and min_interval_seconds < 0.0:
+            raise ValueError("chat.sync.channel_policies[].min_interval_seconds must be >= 0")
+
+        last_n_any = entry_any.get("last_n_messages", None)
+        last_n_messages = None if last_n_any is None else int(last_n_any)
+        if last_n_messages is not None and last_n_messages < 0:
+            raise ValueError("chat.sync.channel_policies[].last_n_messages must be >= 0")
+
+        rx_any = entry_any.get("require_recent_rx_seconds", None)
+        require_recent_rx_seconds = None if rx_any is None else float(rx_any)
+        if require_recent_rx_seconds is not None and require_recent_rx_seconds < 0.0:
+            raise ValueError("chat.sync.channel_policies[].require_recent_rx_seconds must be >= 0")
+
+        channel_policies.append(
+            ChannelSyncPolicy(
+                channel=chan,
+                match_prefix=match_prefix,
+                enabled=enabled,
+                defer=defer,
+                min_interval_seconds=min_interval_seconds,
+                last_n_messages=last_n_messages,
+                require_recent_rx_seconds=require_recent_rx_seconds,
+            )
+        )
+
     # -----------------------------------------------
     # -------------------------------
 
@@ -359,6 +424,9 @@ def load_chat_config_from_yaml(path: str) -> MeshChatConfig:
         sync_max_send_per_response=sync_max_send_per_response,
         sync_auto_sync_on_new_peer=sync_auto_sync_on_new_peer,
         sync_min_sync_interval_seconds=sync_min_sync_interval_seconds,
+        retention_enabled=retention_enabled,
+        retention_days=retention_days,
+        sync_channel_policies=channel_policies,
         targeted_sync_enabled=targeted_sync_enabled,
         targeted_sync_merge_distance=targeted_sync_merge_distance,
         targeted_sync_max_range_len=targeted_sync_max_range_len,
