@@ -55,13 +55,13 @@ chat:
       nick: Alice
 gui:
   colors:
-    window_bg: '#1e1e1e'
-    chat_bg: '#111111'
-    chat_fg: '#e6e6e6'
-    input_bg: '#222222'
-    input_fg: '#e6e6e6'
-    list_bg: '#1a1a1a'
-    list_fg: '#e6e6e6'
+    window_bg: '#ffffff'
+    chat_bg: '#ffffff'
+    chat_fg: '#000000'
+    input_bg: '#ffffff'
+    input_fg: '#000000'
+    list_bg: '#ffffff'
+    list_fg: '#000000'
     me: '#4fc3f7'
     known: '#a5d6a7'
     unknown: '#ffcc80'

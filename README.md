@@ -57,11 +57,6 @@ It combines:
 
 The result is a system that behaves sensibly on HF/VHF while remaining debuggable, testable, and extensible.
 
-This is **not**:
-- A generic IP mesh
-- A flooding chat toy
-- A future roadmap or research prototype
-
 Everything described here exists in the code.
 
 ---
