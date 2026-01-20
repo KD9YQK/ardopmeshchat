@@ -78,7 +78,7 @@ class TcpMeshLinkConfig:
 
 @dataclass
 class TcpMeshConfig:
-    server: TcpMeshServerConfig = TcpMeshServerConfig()
+    server: TcpMeshServerConfig = field(default_factory=TcpMeshServerConfig)
     links: List[TcpMeshLinkConfig] = field(default_factory=list)
 
 
@@ -94,5 +94,5 @@ class MeshNodeConfig:
 
     # Optional TCP mesh links (server and/or client links)
     tcp_mesh: Optional[TcpMeshConfig] = None
-    routing_config: MeshRoutingConfig = MeshRoutingConfig()
-    security_config: MeshSecurityConfig = MeshSecurityConfig()
+    routing_config: MeshRoutingConfig = field(default_factory=MeshRoutingConfig)
+    security_config: MeshSecurityConfig = field(default_factory=MeshSecurityConfig)
